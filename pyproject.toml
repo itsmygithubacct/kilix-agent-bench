@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kilix-agent-bench"
+version = "0.1.0"
+description = "Reproducible agent task evaluation in owned disposable VMs"
+requires-python = ">=3.11"
+license = "MIT"
+readme = "README.md"
+dependencies = []
+
+[project.scripts]
+kilix-agent-bench = "kilix_agent_bench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
