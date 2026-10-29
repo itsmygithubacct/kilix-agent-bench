@@ -7,11 +7,12 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from kilix_agent_bench.core import (BenchError, Store, acquire_image, atomic_json,
                                    command, digest, validate_config)
 from kilix_agent_bench.tasks import OBSERVE, payload, verify
+from kilix_agent_bench.qualification import qualify
 from kilix_agent_bench.vm import VM, process_info
 
 
@@ -136,6 +137,24 @@ class RuntimeTests(unittest.TestCase):
             process.terminate()
             process.wait(timeout=5)
 
+    def test_unreadable_process_is_not_assumed_dead(self):
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            vm = self.fake_vm(process.pid)
+            original = Path.read_text
+            def read(path, *args, **kwargs):
+                if path == Path('/proc') / str(process.pid) / 'stat':
+                    raise PermissionError('process inspection denied')
+                return original(path, *args, **kwargs)
+            with patch.object(Path, 'read_text', read):
+                with self.assertRaisesRegex(BenchError, 'inspect'):
+                    vm.destroy()
+            self.assertTrue(vm.path.exists())
+            self.assertIsNone(process.poll())
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+
     def test_competing_lifecycle_operation_is_refused(self):
         vm = self.fake_vm()
         with (self.store.root / "vms" / f".{vm.ident}.lock").open("w") as lock:
@@ -173,6 +192,38 @@ class RuntimeTests(unittest.TestCase):
             current['start_ticks'] = '43'
             with self.assertRaisesRegex(BenchError, 'ownership mismatch'):
                 vm.owned_process()
+
+    def test_log_copy_failure_still_attempts_guest_teardown(self):
+        vm = Mock()
+        vm.ident = 'vm-123456789abc'
+        vm.path = self.store.vm_dir(vm.ident)
+        vm.path.mkdir(mode=0o700)
+        (vm.path / 'serial.log').write_text('synthetic boot output')
+        vm.state = {}
+        vm.start.side_effect = BenchError('synthetic boot failure')
+        vm.destroy.side_effect = lambda: shutil.rmtree(vm.path)
+        with patch('kilix_agent_bench.qualification.VM.create', return_value=vm), \
+             patch('kilix_agent_bench.qualification.shutil.copyfile', side_effect=OSError('disk full')):
+            result = qualify(self.store, config())
+        vm.destroy.assert_called_once()
+        self.assertEqual(result['status'], 'invalid_infrastructure')
+        self.assertEqual(result['cleanup'], 'passed')
+
+    def test_progress_callback_failure_still_attempts_guest_teardown(self):
+        vm = Mock()
+        vm.ident = 'vm-123456789abc'
+        vm.path = self.store.vm_dir(vm.ident)
+        vm.path.mkdir(mode=0o700)
+        vm.state = {}
+        vm.start.side_effect = BenchError('synthetic boot failure')
+        vm.destroy.side_effect = lambda: shutil.rmtree(vm.path)
+        def progress(message):
+            if message.startswith('Stopping'):
+                raise OSError('progress output closed')
+        with patch('kilix_agent_bench.qualification.VM.create', return_value=vm):
+            result = qualify(self.store, config(), progress)
+        vm.destroy.assert_called_once()
+        self.assertEqual(result['cleanup'], 'passed')
 
 
 def file_record(data):

@@ -86,7 +86,7 @@ def process_info(pid):
         for entry in (root / "fd").iterdir():
             try:
                 opened.append(os.readlink(entry))
-            except OSError:
+            except FileNotFoundError:
                 continue
         return {"pid": pid, "start_ticks": fields[19],
                 "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
@@ -94,8 +94,21 @@ def process_info(pid):
                 "cwd": str((root / "cwd").resolve(strict=True)),
                 "open_files": opened,
                 "argv": (root / "cmdline").read_bytes().decode().split("\0")[:-1]}
-    except (OSError, ValueError, IndexError):
-        return None
+    except (FileNotFoundError, ProcessLookupError) as exc:
+        # An individual proc entry can disappear while the process is alive
+        # (for example an unlinked cwd). Only a missing process or a zombie
+        # proves that cleanup may proceed without stopping it.
+        try:
+            remaining = (Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
+            if remaining[0] == 'Z':
+                return None
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        except (OSError, ValueError, IndexError) as detail:
+            raise BenchError(f"Cannot inspect process {pid}: {detail}") from detail
+        raise BenchError(f"Cannot completely inspect live process {pid}: {exc}") from exc
+    except (OSError, ValueError, IndexError) as exc:
+        raise BenchError(f"Cannot inspect process {pid}: {exc}") from exc
 
 
 def qmp(path, name):

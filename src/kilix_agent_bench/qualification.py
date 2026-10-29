@@ -85,11 +85,17 @@ def qualify(store, config, progress=lambda message: None):
                 if (vm.path / "qemu.log").is_file():
                     shutil.copyfile(vm.path / "qemu.log", path / "qemu.log")
                 record["final_vm_state"] = vm.state.copy()
-                vm.destroy()
-                record["cleanup"] = "passed"
-                record["vm_directory_removed"] = not vm.path.exists()
             except BaseException as exc:
-                record.update(cleanup="failed", cleanup_error=f"{type(exc).__name__}: {exc}", status="invalid_infrastructure")
+                record.update(evidence_error=f"{type(exc).__name__}: {exc}", status="invalid_infrastructure")
+            finally:
+                # Evidence retention and progress output must never prevent
+                # an attempt to stop the owned guest.
+                try:
+                    vm.destroy()
+                    record["cleanup"] = "passed"
+                    record["vm_directory_removed"] = not vm.path.exists()
+                except BaseException as exc:
+                    record.update(cleanup="failed", cleanup_error=f"{type(exc).__name__}: {exc}", status="invalid_infrastructure")
         else:
             record["cleanup"] = "no_guest_started"
         record.update(completed_at=now(), elapsed_s=time.monotonic() - started)
