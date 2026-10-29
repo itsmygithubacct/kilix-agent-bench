@@ -6,6 +6,7 @@ import sys
 from .core import BenchError, Store, load_config
 from .qualification import qualify
 from .vm import VM, doctor
+from .stack import capture, load_lock, provision
 
 
 def main(argv=None):
@@ -21,10 +22,27 @@ def main(argv=None):
     create.add_argument("--config", required=True)
     for name in ("start", "status", "stop", "reset", "destroy"):
         ops.add_parser(name).add_argument("id")
+    stack_parser = sub.add_parser("stack", help="Freeze and provision an explicitly selected stack offline")
+    stack_ops = stack_parser.add_subparsers(dest="operation", required=True)
+    stack_ops.add_parser("capture").add_argument("--inputs", required=True)
+    stack_ops.add_parser("qualify").add_argument("--lock", required=True)
+    install = stack_ops.add_parser("provision")
+    install.add_argument("id")
+    install.add_argument("--lock", required=True)
     args = parser.parse_args(argv)
     try:
         store = Store(args.data_dir)
-        if args.command == "doctor":
+        progress = lambda msg: print(msg, file=sys.stderr, flush=True)
+        if args.command == "stack":
+            if args.operation == "capture":
+                result = capture(store, args.inputs, progress)
+            elif args.operation == "qualify":
+                _, _, _, config = load_lock(args.lock)
+                result = qualify(store, config, progress, stack_lock=args.lock)
+            else:
+                result = provision(VM(store, args.id), args.lock, progress)
+            code = 2 if result.get("status") in ("invalid_infrastructure", "interrupted", "failed") else 0
+        elif args.command == "doctor":
             result = doctor(store, load_config(args.config))
             code = 0 if result["ok"] else 2
         elif args.command == "qualify":

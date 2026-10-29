@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import platform
+import select
+import shlex
 import shutil
 import signal
 import socket
@@ -315,15 +317,18 @@ class VM:
             raise
         return self.state
 
-    def ssh(self, script, *, timeout=30, check=True):
+    def ssh_argv(self, remote="python3 -"):
         if not self.owned_process():
             raise BenchError("Guest process is not running")
-        argv = ["ssh", "-F", "/dev/null", "-i", str(self.path / "client_key"), "-p", str(self.state["port"]),
+        return ["ssh", "-F", "/dev/null", "-i", str(self.path / "client_key"), "-p", str(self.state["port"]),
                 "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
                 "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={self.path / 'known_hosts'}",
                 "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ConnectTimeout=2", "-o", "ConnectionAttempts=1",
                 "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                "root@127.0.0.1", "python3 -"]
+                "root@127.0.0.1", remote]
+
+    def ssh(self, script, *, timeout=30, check=True):
+        argv = self.ssh_argv()
         try:
             result = subprocess.run(argv, input=script.encode(), capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
@@ -331,6 +336,32 @@ class VM:
         if check and result.returncode:
             raise BenchError(f"Guest transport/command exited {result.returncode}: {result.stderr.decode(errors='replace')[-1200:]}")
         return result
+
+    @serialized
+    def upload(self, source, destination, *, timeout=600):
+        """Stream a file to a new guest path without loading it into memory."""
+        if not isinstance(destination, str) or not destination.startswith("/") or "\0" in destination:
+            raise BenchError("Upload destination must be an absolute guest path")
+        script = """import hashlib, json, os, sys
+h = hashlib.sha256()
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, 'wb') as out:
+    for block in iter(lambda: sys.stdin.buffer.read(1024 * 1024), b''):
+        out.write(block)
+        h.update(block)
+    out.flush()
+    os.fsync(out.fileno())
+print(json.dumps({'sha256': h.hexdigest()}))
+"""
+        argv = self.ssh_argv(shlex.join(["python3", "-c", script, destination]))
+        try:
+            with Path(source).open("rb") as stream:
+                result = subprocess.run(argv, stdin=stream, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise BenchError("Guest upload timed out") from exc
+        if result.returncode:
+            raise BenchError(f"Guest upload failed: {result.stderr.decode(errors='replace')[-1200:]}")
+        return json.loads(result.stdout)
 
     def wait_ready(self):
         deadline = time.monotonic() + self.state["config"]["vm"]["boot_timeout_s"]
@@ -353,30 +384,36 @@ class VM:
     def stop(self):
         current = self.owned_process()
         if current:
-            # Bind a recovered process before QMP closes its disk descriptors.
+            # Bind the kernel process before asking QEMU to exit. Its proc
+            # arguments and executable can disappear during shutdown, so wait
+            # on the pidfd instead of inspecting that transitional state.
             self.state["process"] = current
             self.save()
             try:
-                qmp(self.path / "qmp.sock", "quit")
-            except (OSError, ValueError, BenchError):
-                pass
-            deadline = time.monotonic() + 5
-            while self.owned_process() and time.monotonic() < deadline:
-                time.sleep(0.1)
-            if self.owned_process():
                 fd = os.pidfd_open(current["pid"])
+            except ProcessLookupError:
+                fd = None
+            if fd is not None:
                 try:
                     confirmed = self.owned_process()
-                    if confirmed is None or any(confirmed[k] != current[k] for k in ("pid", "start_ticks", "boot_id")):
-                        raise BenchError("Process changed before cleanup")
-                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    if confirmed is not None:
+                        if any(confirmed[k] != current[k] for k in ("pid", "start_ticks", "boot_id")):
+                            raise BenchError("Process changed before cleanup")
+                        exited = select.poll()
+                        exited.register(fd, select.POLLIN)
+                        try:
+                            qmp(self.path / "qmp.sock", "quit")
+                        except (OSError, ValueError, BenchError):
+                            pass
+                        if not exited.poll(5000):
+                            try:
+                                signal.pidfd_send_signal(fd, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            if not exited.poll(5000):
+                                raise BenchError("Guest process did not stop")
                 finally:
                     os.close(fd)
-                deadline = time.monotonic() + 5
-                while self.owned_process() and time.monotonic() < deadline:
-                    time.sleep(0.1)
-                if self.owned_process():
-                    raise BenchError("Guest process did not stop")
         self.state.update(phase="stopped", process=None)
         (self.path / "qemu.pid").unlink(missing_ok=True)
         (self.path / "qmp.sock").unlink(missing_ok=True)
@@ -391,6 +428,7 @@ class VM:
             self.save()
             (self.path / "disk.qcow2").unlink()
             self._disk(base)
+            self.state.pop("stack", None)
             self.state.update(phase="stopped", generation=self.state["generation"] + 1)
             self.save()
         return self.start()

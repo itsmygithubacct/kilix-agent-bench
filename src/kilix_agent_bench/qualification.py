@@ -12,6 +12,7 @@ from . import __version__
 from .core import BenchError, atomic_json, digest, now, private_dir
 from .tasks import fixture_actor, observe, payload, prepare, verify
 from .vm import VM
+from .stack import check_interfaces, provision
 
 
 PROVENANCE = """import hashlib, json, platform, shutil
@@ -23,7 +24,7 @@ print(json.dumps({'kernel': platform.release(), 'os_release': Path('/etc/os-rele
 """
 
 
-def qualify(store, config, progress=lambda message: None):
+def qualify(store, config, progress=lambda message: None, *, stack_lock=None):
     ident = "run-" + uuid.uuid4().hex[:12]
     path = private_dir(store.root / "runs" / ident)
     record = {"schema": "kilix-agent-bench/qualification-v1", "id": ident, "status": "running",
@@ -32,6 +33,9 @@ def qualify(store, config, progress=lambda message: None):
               "usage": {"model_calls": 0, "measurement": "no_model_invoked"},
               "harness": {"version": __version__, "python_sha256": digest(sys.executable),
                           "source_sha256": {p.name: digest(p) for p in sorted(Path(__file__).parent.glob('*.py'))}}}
+    if stack_lock is not None:
+        record.update(runtime_profile="kilix-stack-fixture", stack_lock_sha256=digest(stack_lock),
+                      stack_provisioning=[], stack_interfaces=[])
     report = path / "result.json"
     atomic_json(report, record)
     vm = None
@@ -52,6 +56,15 @@ def qualify(store, config, progress=lambda message: None):
                 progress("Resetting the guest disk before the negative control")
                 vm.reset()
                 record["reset_generation"] = vm.state["generation"]
+            if stack_lock is not None:
+                record["stack_provisioning"].append(provision(vm, stack_lock, progress))
+                atomic_json(report, record)
+                progress("Qualifying guest engine, verbs, asset readiness and fixture session launches")
+                check = check_interfaces(vm, stack_lock)
+                record["stack_interfaces"].append(check)
+                atomic_json(report, record)
+                if check["status"] != "passed":
+                    raise BenchError("Guest stack interface qualification failed; see stack_interfaces")
             progress(f"Running {label} literal-file control")
             content = payload()
             prepare(vm, content)
@@ -72,6 +85,9 @@ def qualify(store, config, progress=lambda message: None):
             if not matched:
                 raise BenchError(f"{label} control did not match the independent oracle")
         record["status"] = "passed"
+        if stack_lock is not None:
+            record["kilix_stack_qualified"] = True
+            record["stack_qualification_scope"] = record["stack_interfaces"][-1]["scope"]
     except BaseException as exc:
         record.update(status="invalid_infrastructure", error=f"{type(exc).__name__}: {exc}")
         if isinstance(exc, KeyboardInterrupt):

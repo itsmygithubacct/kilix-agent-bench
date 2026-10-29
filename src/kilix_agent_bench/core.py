@@ -82,7 +82,7 @@ class Store:
         if self.root in (Path("/"), Path.home().resolve()):
             raise BenchError("Use a dedicated data directory")
         private_dir(self.root)
-        for name in ("images", "vms", "studies", "mining", "runs", "reports", "cache"):
+        for name in ("images", "stacks", "vms", "studies", "mining", "runs", "reports", "cache"):
             private_dir(self.root / name)
 
     @contextmanager

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -192,6 +193,53 @@ class RuntimeTests(unittest.TestCase):
             current['start_ticks'] = '43'
             with self.assertRaisesRegex(BenchError, 'ownership mismatch'):
                 vm.owned_process()
+
+    def test_shutdown_can_lose_proc_arguments_after_quit(self):
+        process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)',
+                                    '-name', 'vm-123456789abc', '-uuid', 'fixture-uuid'])
+        try:
+            vm = self.fake_vm(process.pid)
+            current = vm.state['process'].copy()
+            vm.state['qemu_exe'] = current['exe']
+            vm.save()
+            quitting = False
+            def inspect(pid):
+                return {**current, 'argv': []} if quitting else current
+            def quit_guest(*args):
+                nonlocal quitting
+                quitting = True
+                process.terminate()
+            with patch('kilix_agent_bench.vm.process_info', side_effect=inspect), \
+                 patch('kilix_agent_bench.vm.qmp', side_effect=quit_guest):
+                vm.destroy()
+            self.assertFalse(vm.path.exists())
+            self.assertIsNotNone(process.poll())
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+
+    def test_pidfd_binding_rechecks_identity_before_quit_or_signal(self):
+        process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)',
+                                    '-name', 'vm-123456789abc', '-uuid', 'fixture-uuid'])
+        try:
+            vm = self.fake_vm(process.pid)
+            current = vm.state['process'].copy()
+            vm.state['qemu_exe'] = current['exe']
+            vm.save()
+            changed = {**current, 'start_ticks': str(int(current['start_ticks']) + 1)}
+            with patch('kilix_agent_bench.vm.process_info', side_effect=[current, changed]), \
+                 patch('kilix_agent_bench.vm.qmp') as quit_guest, \
+                 patch('kilix_agent_bench.vm.signal.pidfd_send_signal') as send_signal:
+                with self.assertRaisesRegex(BenchError, 'ownership mismatch'):
+                    vm.destroy()
+            quit_guest.assert_not_called()
+            send_signal.assert_not_called()
+            self.assertTrue(vm.path.exists())
+            self.assertIsNone(process.poll())
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
 
     def test_log_copy_failure_still_attempts_guest_teardown(self):
         vm = Mock()
