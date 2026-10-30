@@ -1,13 +1,13 @@
 # kilix-agent-bench
 
 An importable Python library and CLI for reproducible agent task evaluation in
-disposable VMs. It qualifies VM creation, provisioning, reset, observation and
-cleanup using deterministic fixture actors. It can also freeze a selected Kilix
-stack and provision it offline, then check real guest pane and session-grid
-interfaces. Qualification makes no model calls. Scored model execution and
-usage accounting remain future work.
+disposable VMs. It freezes and provisions a selected Kilix stack, checks real
+guest interfaces, and runs bounded controller sessions with independent outcome
+scoring and native token accounting. Hosted and self-hosted controllers operate
+as separate tracks feeding one dataset. Planning is the default; execution
+requires an explicit flag and matching qualification evidence.
 
-The qualification copies a synthetic file containing shell punctuation and
+The base qualification copies a synthetic file containing shell punctuation and
 Unicode, preserving every byte and adding no newline. An unprivileged guest
 actor performs the copy. A separate privileged observer reads the resulting
 files; the host checks them against its own expectations. A second control
@@ -19,7 +19,9 @@ must match their expected outcomes for qualification to pass.
 Use Linux on x86-64, Python 3.11 or newer, accessible `/dev/kvm`, QEMU,
 `qemu-img`, OpenSSH client tools and `xorriso`. The initial backend requires KVM;
 it does not silently switch to software emulation. Python runtime dependencies
-are limited to the standard library.
+are limited to the standard library. Controller isolation also requires
+Bubblewrap. Action auditing requires an explicitly selected `strace` binary
+compatible with the guest; its hash is included in the protocol lock.
 
 From this checkout:
 
@@ -206,16 +208,169 @@ Model, effort and client selections belong to the execution matrix, separate
 from the fixed protocol. Adding a later model reuses the same tasks, seeds,
 guides and software inputs. Record execution dates and provider-reported model
 identities too: a stable model name alone does not freeze a remote service.
-No scored runner or provider adapter is implemented by these configuration
-conventions.
+
+## Task routes and independent scoring
+
+The development suite has six task types and sixteen task/route cells:
+
+| Task | Routes | Observed result |
+| --- | --- | --- |
+| Literal file search | Native shell; Needle Files grammar CLI | Exact relative paths and first matching lines, excluding hidden files and symlinks |
+| Literal pane input | Native remote control; `kilix pane send` | Exact UTF-8 bytes with no Enter or extra pane |
+| Total RAM | Native shell; System CLI; Kilix grammar | Value and units checked against guest `/proc/meminfo` |
+| Active log retrieval | Native process/open-file inspection; `kilix rollout log` | Correct active log and last assistant text, with stale decoys |
+| One worker launch | Session-grid CLI; structured action CLI; Claudex; Ask grammar; Ask LFM2 model-only | Exactly one live fixture process and pane with the requested model, cwd and effort |
+| Visible pane reading | Native remote control; `kilix watch` | Visible marker, excluding scrollback and without input |
+
+Worker clients are labeled process fixtures: they verify delivery and launch
+effects without creating child provider sessions. A pending launch receipt does
+not override the independently observed process state. Outcome correctness and
+required-route compliance are recorded separately; both are needed for an
+eligible success. Every task also checks protected fixture hashes and unrelated
+state. Positive and negative controls exercise the scorers.
+
+```sh
+kilix-agent-bench qualify-routes --lock /path/to/stack-lock.json --slots 2
+```
+
+This command defaults to fifteen routes without inference. Adding
+`--allow-helper-inference` includes the local LFM2 model-only route. Qualification
+records never enter the scored dataset. Each qualification slot owns one VM,
+recreates its fixtures between controls, and destroys the guest on completion.
+
+## Freeze, plan and execute
+
+```sh
+kilix-agent-bench study freeze --lock /path/to/stack-lock.json
+kilix-agent-bench study manifest --protocol /path/to/protocol.json \
+  --matrix /path/to/matrix.json --track hosted_api --rounds 1
+kilix-agent-bench study manifest --protocol /path/to/protocol.json \
+  --matrix /path/to/matrix.json --track vast_self_hosted --rounds 1
+kilix-agent-bench run --manifest /path/to/manifest.json --slots 2
+```
+
+The final command only reports a plan. A protocol binds task generators,
+scorers, common instructions, route cards, tool schema, budgets, stack bytes,
+audit binary, harness source hashes and five paired development seeds. An
+optional `--reserved` JSON file records a separate future evaluation partition;
+it does not create additional scored cases. Keep private study plans and model
+metadata under `studies/` in the runtime root.
+
+A matrix contains `configurations`: each has a unique `id`, exact `model`,
+`location` (`provider` or `self_hosted`), and a native client plus `effort` or a
+self-hosted `profile`. Supported native clients are `codex`, `grok` and `claude`.
+Self-hosted configurations also reference entries in `self_hosted_models`, each
+with a `repository_revision` and `profiles` containing `id`, `settings`,
+`precision`, `context_tokens` and optional hashed `metadata_artifacts`.
+Artifact paths resolve relative to the matrix file. Settings, client executable
+hashes and the complete schedule are copied into immutable manifests.
+
+Execution adds `--execute --readiness /path/to/receipt.json`. The trusted
+operator supplies a `kilix-agent-bench/execution-readiness-v1` receipt naming
+the matching `protocol_sha256`, `qualified_routes` pairs, and evidence for each
+configuration. Each configuration proof must contain its
+`configuration_sha256` and true `model_accepted`, `settings_verified`,
+`usage_complete` and `vm_tool_verified` fields. Two slots additionally require
+`two_slots_verified: true`. These are declarations backed by reviewed live
+qualification evidence, not a substitute for running that qualification.
+
+Self-hosted execution additionally selects `--configuration ID --endpoint
+/path/to/endpoint.json`. The endpoint records `url`, `served_model`, the exact
+`configuration_sha256`, optional `key_env`, and `runtime` with a container
+`image` digest, `repository_revision`, `precision`, `context_tokens` and
+`launch_argv` identifying parser/template settings. HTTPS or a loopback tunnel
+is required; redirects and mismatched served-model identities are rejected.
+Credentials are referenced by environment variable, never embedded in the URL.
+The harness does not create a GPU rental or start an inference server.
+
+Every scored attempt creates and provisions a fresh guest. At most two VM
+slots are shared across both tracks and runner processes. A per-track lock
+prevents duplicate concurrent batches. Completed task failures are retained
+without automatic retries; interrupted or infrastructure-invalid attempts get
+new attempt IDs on resume. Logical IDs bind configuration settings as well as
+task, route, seed and protocol. Extending a one-round manifest to five rounds
+therefore preserves its completed first-round identities.
+
+```sh
+kilix-agent-bench recover-attempt /path/to/interrupted-attempt
+kilix-agent-bench dataset report
+kilix-agent-bench timings /path/to/attempt/timings.jsonl
+```
+
+Resume reconciles finalized attempts before scheduling, including crashes
+between evidence finalization and progress recording. Recovery only destroys
+the VM explicitly recorded in that store's attempt. Already-finalized evidence
+remains immutable; later cleanup produces a separate recovery receipt.
+
+## Evidence and measurement
+
+Each attempt retains the exact prompt and configuration, native client events,
+raw self-hosted requests/responses, normalized usage, guest command arguments,
+bounded outputs and truncation flags, execution audit, independent before/after
+observations, scores, timings and cleanup status. A SHA-256 inventory covers all
+retained evidence. Ingestion verifies that inventory and deduplicates attempt
+IDs. Mutable native-client account state is removed before finalization.
+
+Native controllers receive a fresh isolated home at their normal home path,
+read-only credentials, and only the guest command tool. Host files and SSH keys
+are outside that namespace. Provider networking remains available. These are
+controlled fixtures: command admission and execution auditing do not prove
+adversarial isolation against arbitrary interpreter code or a compromised
+controller. Live model/effort acceptance and tool behavior require separate
+qualification for every selected client configuration.
+
+The primary report is controller tokens per verified success within a
+configuration/task/route, including tokens spent on valid failures. Input totals
+include cached context; output totals include reasoning where the provider
+reports that subset. Neither subset is added twice. Local helper inference
+tokens are excluded, while its output consumed by the controller contributes
+to subsequent controller input. Missing, conflicting or unreconciled usage
+cannot produce a savings score. Zero successes cannot produce one either.
+Native clients may expose session aggregates rather than individual responses;
+the normalization record states the available granularity.
+
+Limits cover tool calls, command duration, output bytes, controller turns and
+session wall time. Token budgets are checked between observable responses, so
+an in-flight response can overshoot. Native output-token caps are not assumed
+when a client cannot expose one. Self-hosted cancellation takes effect between
+requests, with a bounded in-flight timeout. UTC timestamps and monotonic phase
+durations include queueing, provisioning, model sessions or requests, tools,
+scoring and teardown. Nested spans and concurrent trials are never summed into
+an invented batch duration. Timing informs future capacity estimates rather
+than serving as a route-efficiency ranking.
+
+## Project rental spending
+
+Project receipts live at
+`~/.local/gpu_terminal/kilix-agent-bench/rentals/spending.jsonl` by default.
+These commands only import and report records:
+
+```sh
+kilix-agent-bench rentals import-quote /path/to/best-of-3-receipt.json
+kilix-agent-bench rentals record /path/to/owned-instance-or-billing-receipt.json
+kilix-agent-bench rentals report
+```
+
+A receipt needs a stable `event_id`, timezone-qualified `at`, `kind`, source
+identity and `source_sha256`. Register project ownership using `instance_created`
+with `instance_id` and separate `compute_per_hour` and `storage_per_hour` rates.
+Record `instance_state` transitions as `running`, `stopped` or `destroyed`.
+Provider `charge` and `credit` receipts require nonnegative `usd` amounts and a
+unique `billing_id`. Only registered project instances can receive those rows.
+
+Quotes, time/rate estimates and imported charges remain separate. Storage can
+continue while compute is stopped. Unknown billing intervals are reported,
+unrecorded transfers are excluded, and estimates are never added to charges.
+The report covers imported project receipts, not the account's entire balance.
 
 ## Qualification boundaries
 
 Base-only `qualify` records `kilix_stack_qualified: false`. Successful
 `stack qualify` records the tested interface scope explicitly. It covers the
-guest OS interfaces and model asset readiness described above; real provider
-clients, model inference, remaining action routes, guide comparisons and token
-accounting require separate adapters and qualification before a scored study.
+guest OS interfaces and model asset readiness described above. The route
+controls and offline adapter tests extend that coverage; they do not establish
+live provider readiness, guide savings or a working rented inference image.
+Those require separate qualification before a scored study.
 Select and freeze compatible source and executable versions during experiment
 preparation. A capture is a replayable software artifact, not a claim that its
 binary can be rebuilt bit for bit from source.
