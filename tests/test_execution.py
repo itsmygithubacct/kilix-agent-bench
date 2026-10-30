@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 from kilix_agent_bench.bridge import Bridge
-from kilix_agent_bench.clients import self_hosted_client, stream_process, validate_endpoint
+from kilix_agent_bench.clients import native_client, self_hosted_client, session_records, stream_process, validate_endpoint
 from kilix_agent_bench.core import BenchError, Store, atomic_json, private_dir
 from kilix_agent_bench.dataset import Dataset, finalize, verify_evidence
 from kilix_agent_bench.protocol import DEFAULT_LIMITS, build_manifest, validate_manifest
@@ -169,6 +169,50 @@ class RuntimeTests(unittest.TestCase):
             if cancel: event.set()
             _, code, timed_out = stream_process([sys.executable, "-c", "import time; time.sleep(30)"], dict(os.environ), "", path, 0.05, cancelled=event)
             self.assertTrue(timed_out); self.assertNotEqual(code, 0)
+
+
+class NativeEvidenceTests(unittest.TestCase):
+    def test_live_partial_tail_is_distinct_from_corrupt_final_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "session.jsonl"
+            source.write_text('{"type":"assistant"}\n{"type":')
+            self.assertEqual(session_records(root, partial=True), [{"type": "assistant"}])
+            with self.assertRaises(BenchError): session_records(root)
+            source.write_text('broken\n{"type":"assistant"}\n')
+            with self.assertRaises(BenchError): session_records(root, partial=True)
+
+    def test_restricted_tools_and_session_metadata_survive_private_home_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = private_dir(root / "operator")
+            private_dir(home / ".grok").joinpath("auth.json").write_text("{}")
+            path = private_dir(root / "attempt")
+            configuration = {"id": "fixture", "client": "grok", "model": "client-model", "effort": "low"}
+
+            def process(command, environment, prompt, output_path, timeout_s, **kwargs):
+                self.assertEqual(command[command.index("--tools") + 1], "search_tool,use_tool")
+                session = private_dir(path / "client-home/.grok/sessions/fixture")
+                atomic_json(session / "summary.json", {"info": {"id": "fixture-session"},
+                            "current_model_id": "client-model", "reasoning_effort": "low",
+                            "unrelated_account_field": "must-not-copy"})
+                atomic_json(session / "usage.json", {"session": {"inputTokens": 20, "outputTokens": 4,
+                            "modelCalls": 1, "modelUsage": {"provider-model": {}}}})
+                (session / "system_prompt.txt").write_text("fixture policy")
+                atomic_json(session / "tool_definitions.json", ["search_tool", "use_tool"])
+                return [{"type": "system", "model": "client-model", "session_id": "fixture-session"}], 0, False
+
+            with patch("kilix_agent_bench.clients.Path.home", return_value=home), \
+                 patch("kilix_agent_bench.clients.executable", return_value=Path(sys.executable)), \
+                 patch("kilix_agent_bench.clients.Bridge"), \
+                 patch("kilix_agent_bench.clients.stream_process", side_effect=process):
+                result = native_client(configuration, "task", lambda args: {}, path,
+                                       Timings(path / "timings.jsonl"), DEFAULT_LIMITS)
+            self.assertFalse((path / "client-home").exists())
+            self.assertEqual(result["usage"]["observed_efforts"], ["low"])
+            self.assertNotIn("unrelated_account_field", json.loads((path / "client-session.json").read_text()))
+            self.assertEqual((path / "grok-system_prompt.txt").read_text(), "fixture policy")
+            self.assertEqual((path / "client-session.json").stat().st_mode & 0o777, 0o600)
 
 
 class SelfHostedTests(unittest.TestCase):

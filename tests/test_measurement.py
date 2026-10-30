@@ -131,6 +131,73 @@ class UsageTests(unittest.TestCase):
         value = normalize_grok([], {"totals": {"inputTokens": 100, "outputTokens": 8, "cachedInputTokens": 50}})
         self.assertEqual(value["total_tokens"], 108)
 
+    def test_saved_message_deltas_complete_streamed_blocks_without_double_counting(self):
+        def message(ident, output, **extra):
+            return {"type": "assistant", "message": {"id": ident, "model": "test-model",
+                    "usage": {"input_tokens": 2, "cache_read_input_tokens": 10,
+                              "cache_creation_input_tokens": 3, "output_tokens": output}}, **extra}
+        events = [message("a", 24), message("b", 8),
+                  {"type": "result", "usage": {"input_tokens": 4, "cache_read_input_tokens": 20,
+                   "cache_creation_input_tokens": 6, "output_tokens": 104}}]
+        rollouts = [message("a", 85, effort="low", perTurnEffort="low"),
+                    message("b", 19, effort="low", perTurnEffort="low")]
+        value = normalize_messages(events, rollouts)
+        self.assertEqual(value["ranking_total_tokens"], 134)
+        self.assertEqual(value["response_count"], 2)
+        self.assertEqual(value["output_tokens"], 104)
+        self.assertEqual(value["observed_efforts"], ["low"])
+        self.assertEqual(value["effort_coverage"], "complete")
+        self.assertEqual(value["records"][0]["source"], {"rollout_event": 0})
+        # A live disk snapshot may arrive after stdout; keep the larger count.
+        self.assertEqual(normalize_messages(rollouts, events[:-1])["total_tokens"], 134)
+        rollouts[1].pop("effort"); rollouts[1].pop("perTurnEffort")
+        rollouts[1]["message"]["content"] = [{"type": "text", "text": '{"effort":"high"}'}]
+        value = normalize_messages(events, rollouts)
+        self.assertEqual(value["effort_coverage"], "missing")
+        self.assertEqual(value["observed_efforts"], ["low"])
+
+    def test_message_reconciliation_checks_components_and_missing_responses(self):
+        usage = {"input_tokens": 5, "cache_read_input_tokens": 10, "output_tokens": 3}
+        events = [{"type": "assistant", "message": {"id": "a", "model": "test-model", "usage": usage}},
+                  {"type": "result", "usage": {**usage, "cache_read_input_tokens": 9, "output_tokens": 4}}]
+        self.assertEqual(normalize_messages(events)["coverage"], "unreconciled_totals")
+        events[-1]["usage"] = usage
+        events.insert(1, {"type": "assistant", "message": {"id": "missing", "model": "test-model"}})
+        self.assertIsNone(normalize_messages(events)["ranking_total_tokens"])
+
+    def test_message_snapshots_reject_conflicts_and_preserve_effort_changes(self):
+        usage = {"input_tokens": 5, "output_tokens": 10}
+        first = {"type": "assistant", "effort": "low", "perTurnEffort": "high",
+                 "message": {"id": "a", "model": "test-model", "usage": usage}}
+        self.assertEqual(normalize_messages([], [first])["observed_efforts"], ["high", "low"])
+        for change in ({"model": "fallback"}, {"usage": {**usage, "output_tokens": 9}},
+                       {"usage": {**usage, "input_tokens": 6}}):
+            second = {**first, "message": {**first["message"], **change}}
+            with self.assertRaises(BenchError): normalize_messages([], [first, second])
+
+    def test_native_thinking_tokens_are_a_subset(self):
+        row = response_usage("a", {"input_tokens": 5, "output_tokens": 10,
+                             "output_tokens_details": {"thinking_tokens": 7}}, "messages")
+        self.assertEqual(row["total_tokens"], 15)
+        self.assertEqual(row["reasoning_output_tokens"], 7)
+
+    def test_session_identity_keeps_client_and_provider_names_separate(self):
+        events = [{"type": "system", "model": "client-model", "session_id": "session-a"}]
+        ledger = {"session": {"inputTokens": 20, "outputTokens": 4, "modelCalls": 1,
+                              "modelUsage": {"provider-model": {}}}}
+        metadata = {"info": {"id": "session-a"}, "current_model_id": "client-model", "reasoning_effort": "low"}
+        value = normalize_grok(events, ledger, metadata)
+        self.assertEqual(value["observed_models"], ["provider-model"])
+        self.assertEqual(value["client_models"], ["client-model"])
+        self.assertEqual(value["observed_efforts"], ["low"])
+        with self.assertRaises(BenchError):
+            normalize_grok(events, ledger, {**metadata, "info": {"id": "other-session"}})
+
+    def test_zero_call_ledger_is_not_a_zero_token_success(self):
+        value = normalize_grok([], {"session": {"inputTokens": 0, "outputTokens": 0, "modelCalls": 0}})
+        self.assertEqual(value["coverage"], "missing_usage")
+        self.assertIsNone(value["ranking_total_tokens"])
+
 
 class StorageTests(unittest.TestCase):
     def setUp(self):

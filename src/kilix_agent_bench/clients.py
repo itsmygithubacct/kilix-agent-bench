@@ -60,7 +60,7 @@ def native_layout(path, client, configuration, limits):
         config = '[cli]\nauto_update=false\n[features]\ntelemetry=false\nfeedback=false\nlsp_tools=false\ncodebase_indexing=false\n[session]\nload_envrc=false\n[telemetry]\ntrace_upload=false\n' + common_mcp
         (config_dir / "config.toml").write_text(config)
         args = ["--prompt-file", "/bench/work/prompt.txt", "--model", configuration["model"],
-                "--reasoning-effort", configuration["effort"], "--tools", "", "--no-plan", "--no-subagents",
+                "--reasoning-effort", configuration["effort"], "--tools", "search_tool,use_tool", "--no-plan", "--no-subagents",
                 "--disable-web-search", "--always-approve", "--max-turns", str(limits["max_model_turns"]),
                 "--system-prompt-override", SYSTEM, "--output-format", "streaming-messages-json",
                 "--cwd", "/bench/work", "--leader-socket", str(operator_home / ".grok/leader-bench.sock")]
@@ -170,6 +170,26 @@ def native_client(configuration, prompt, execute, path, timings, limits, *, canc
             shutil.rmtree(state)
 
 
+def session_records(root, *, partial=False):
+    records = []
+    for source in sorted(root.rglob("*.jsonl")):
+        text = source.read_text()
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError as exc:
+                if partial and index == len(lines) - 1 and not text.endswith("\n"):
+                    continue  # A live session may be appending its last record.
+                raise BenchError("Malformed native session record") from exc
+            if not isinstance(row, dict):
+                raise BenchError("Native session record must be an object")
+            records.append(row)
+    return records
+
+
 def _native_client(configuration, prompt, execute, path, timings, limits, *, cancelled=None):
     path = Path(path)
     client = configuration["client"]
@@ -199,7 +219,7 @@ def _native_client(configuration, prompt, execute, path, timings, limits, *, can
                         pass  # the writer may currently be appending this line
             value = normalize_codex(events, records)
         elif client == "claude":
-            value = normalize_messages(events)
+            value = normalize_messages(events, session_records(layout["client_home"] / ("." + client) / "projects", partial=True))
         else:
             ledgers = list((layout["client_home"] / ".grok/sessions").glob("**/usage.json"))
             persisted = None
@@ -232,10 +252,13 @@ def _native_client(configuration, prompt, execute, path, timings, limits, *, can
                 append_event(path / "client-rollout.jsonl", row)
         usage = normalize_codex(events, rollouts)
     elif client == "claude":
+        rollouts = session_records(layout["client_home"] / ("." + client) / "projects")
+        for row in rollouts:
+            append_event(path / "client-rollout.jsonl", row)
         for event in events:
             if event.get("type") == "result":
                 answer = event.get("result", "")
-        usage = normalize_messages(events)
+        usage = normalize_messages(events, rollouts)
     else:
         for event in events:
             if event.get("type") == "result":
@@ -245,14 +268,28 @@ def _native_client(configuration, prompt, execute, path, timings, limits, *, can
                 text = "".join(v.get("text", "") for v in contents if isinstance(v, dict) and v.get("type") == "text")
                 if text:
                     answer = text
-        persisted = None
+        persisted, session_metadata = None, None
         ledgers = list((layout["client_home"] / ".grok/sessions").glob("**/usage.json"))
         if len(ledgers) > 1:
             raise BenchError("A fresh single-controller session produced multiple usage ledgers")
         if ledgers:
             persisted = json.loads(ledgers[0].read_text())
             atomic_json(path / "grok-usage.json", persisted)
-        usage = normalize_grok(events, persisted)
+            session = ledgers[0].parent
+            summary_file = session / "summary.json"
+            if summary_file.is_file():
+                summary = json.loads(summary_file.read_text())
+                session_metadata = {key: summary[key] for key in (
+                    "info", "current_model_id", "reasoning_effort", "agent_name"
+                ) if key in summary}
+                atomic_json(path / "client-session.json", session_metadata)
+            for name in ("system_prompt.txt", "tool_definitions.json"):
+                source = session / name
+                if source.is_file():
+                    target = path / ("grok-" + name)
+                    target.write_bytes(source.read_bytes())
+                    target.chmod(0o600)
+        usage = normalize_grok(events, persisted, session_metadata)
     atomic_json(path / "usage.json", usage)
     # Auth is a read-only mount and was never copied. Remove mutable client state after retaining evidence.
     shutil.rmtree(layout["client_home"])

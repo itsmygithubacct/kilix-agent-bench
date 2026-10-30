@@ -311,6 +311,14 @@ observations, scores, timings and cleanup status. A SHA-256 inventory covers all
 retained evidence. Ingestion verifies that inventory and deduplicates attempt
 IDs. Mutable native-client account state is removed before finalization.
 
+Messages clients retain their saved transcript before cleanup. Its finalized
+per-response usage completes early streamed block counts, with message-ID
+deduplication and reconciliation of input, cache and output totals against the
+session result. Resolved effort comes from response metadata; launch flags and
+text inside messages are not evidence of the effort that ran. Grok retains a
+small session metadata record and keeps client model names separate from
+provider ledger names. A provider alias still requires qualification.
+
 Native controllers receive a fresh isolated home at their normal home path,
 read-only credentials, and only the guest command tool. Host files and SSH keys
 are outside that namespace. Provider networking remains available. These are

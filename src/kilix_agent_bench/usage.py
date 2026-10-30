@@ -18,7 +18,7 @@ def response_usage(ident, usage, dialect, *, source=None, model=None):
         writes = count(usage.get("cache_creation_input_tokens", 0))
         input_total = None if None in (uncached, cached, writes) else uncached + cached + writes
         output = count(usage.get("output_tokens"))
-        reasoning = None
+        reasoning = count((usage.get("output_tokens_details") or {}).get("thinking_tokens"))
     elif dialect == "chat":
         input_total = count(usage.get("prompt_tokens"))
         output = count(usage.get("completion_tokens"))
@@ -107,40 +107,67 @@ def normalize_codex(events, rollouts=()):
     return value
 
 
-def normalize_messages(events):
-    messages, result = {}, None
-    for index, event in enumerate(events):
-        if event.get("type") == "assistant":
-            message = event.get("message", {})
-            ident = message.get("id")
-            if ident and isinstance(message.get("usage"), dict):
-                # Native clients can emit several blocks for the same message ID.
-                current = response_usage(ident, message["usage"], "messages", source={"event": index}, model=message.get("model"))
-                if ident in messages:
-                    old = messages[ident]
-                    for key in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens"):
-                        if old[key] != current[key]:
-                            raise BenchError("One message ID has inconsistent input usage")
-                    if (current["output_tokens"] or 0) < (old["output_tokens"] or 0):
-                        raise BenchError("Message output counter decreased")
-                messages[ident] = current
-        if event.get("type") == "result":
-            result = event
-    value = aggregate(list(messages.values()))
+def normalize_messages(events, rollouts=()):
+    messages, result, efforts, response_efforts, expected = {}, None, set(), {}, set()
+    for source_name, records in (("event", events), ("rollout_event", rollouts)):
+        snapshots = {}
+        for index, event in enumerate(records):
+            if event.get("type") == "assistant":
+                message = event.get("message", {})
+                ident = message.get("id")
+                if not ident:
+                    continue
+                expected.add(ident)
+                if source_name == "rollout_event":
+                    resolved = {event[key] for key in ("effort", "perTurnEffort")
+                                if isinstance(event.get(key), str) and event[key]}
+                    efforts.update(resolved)
+                    response_efforts.setdefault(ident, set()).update(resolved)
+                if not isinstance(message.get("usage"), dict):
+                    continue
+                current = response_usage(ident, message["usage"], "messages", source={source_name: index}, model=message.get("model"))
+                if ident in snapshots:
+                    _check_message_snapshot(snapshots[ident], current)
+                snapshots[ident] = current
+            if source_name == "event" and event.get("type") == "result":
+                result = event
+        for ident, current in snapshots.items():
+            if ident in messages:
+                # Streamed blocks can carry an early output count. The saved
+                # transcript receives the final delta, but can lag live stdout.
+                _check_message_snapshot(messages[ident], current, monotonic=False)
+                old_output = messages[ident]["output_tokens"]
+                if old_output is not None and (current["output_tokens"] is None or current["output_tokens"] < old_output):
+                    continue
+            messages[ident] = current
+    value = aggregate(list(messages.values()), expected_responses=len(expected))
     if result and isinstance(result.get("usage"), dict):
         total = response_usage("session-result", result["usage"], "messages")
-        value["session_total"] = total
-        if not messages:
+        if not expected:
             value = aggregate([total])
             value["granularity"] = "session_aggregate"
-        elif total["total_tokens"] != value["total_tokens"]:
+        elif any(total[key] != value[key] for key in (
+            "input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens"
+        )):
             value.update(coverage="unreconciled_totals", ranking_total_tokens=None)
+        value["session_total"] = total
     value.setdefault("granularity", "message")
     value["observed_models"] = sorted({r["model"] for r in messages.values() if r["model"]})
+    value["observed_efforts"] = sorted(efforts)
+    value["effort_coverage"] = "complete" if expected and all(response_efforts.get(ident) for ident in expected) else "missing"
+    value["identity_evidence"] = "native response models and resolved per-response effort in the saved transcript"
     return value
 
 
-def normalize_grok(events, persisted_usage=None):
+def _check_message_snapshot(previous, current, *, monotonic=True):
+    for key in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "model"):
+        if previous[key] != current[key]:
+            raise BenchError("One message ID has inconsistent input usage or model")
+    if monotonic and previous["output_tokens"] is not None and current["output_tokens"] is not None and current["output_tokens"] < previous["output_tokens"]:
+        raise BenchError("Message output counter decreased")
+
+
+def normalize_grok(events, persisted_usage=None, session_metadata=None):
     # The client persists a session usage ledger even when its stdout omits usage.
     if persisted_usage is not None:
         value = persisted_usage
@@ -160,6 +187,21 @@ def normalize_grok(events, persisted_usage=None):
         answer["granularity"] = "session_aggregate"
         answer["model_calls"] = count(value.get("modelCalls"))
         answer["observed_models"] = sorted(value.get("modelUsage", {}))
+        client_models = {event["model"] for event in events
+                         if event.get("type") == "system" and isinstance(event.get("model"), str)}
+        metadata = session_metadata or {}
+        session_id = (metadata.get("info") or {}).get("id")
+        observed_sessions = {event["session_id"] for event in events if event.get("session_id")}
+        if session_id and observed_sessions and observed_sessions != {session_id}:
+            raise BenchError("Saved session metadata belongs to a different controller session")
+        if metadata.get("current_model_id"):
+            client_models.add(metadata["current_model_id"])
+        answer["client_models"] = sorted(client_models)
+        effort = metadata.get("reasoning_effort")
+        answer["observed_efforts"] = [effort] if isinstance(effort, str) and effort else []
+        answer["identity_evidence"] = "provider usage-ledger models; client model and effort recorded separately"
+        if answer["model_calls"] == 0:
+            answer.update(coverage="missing_usage", ranking_total_tokens=None)
         if value.get("totalTokens") is not None and count(value["totalTokens"]) != row["total_tokens"]:
             answer.update(coverage="unreconciled_totals", ranking_total_tokens=None)
         turns = persisted_usage.get("turns")
