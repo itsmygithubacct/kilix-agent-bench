@@ -14,6 +14,24 @@ files; the host checks them against its own expectations. A second control
 deliberately adds a newline and must be scored as a task failure. Both controls
 must match their expected outcomes for qualification to pass.
 
+**Status:** a standalone evaluation harness, version 0.1.0. Plebian-OS, Kilix
+and the Kilix content catalog do not install it or reference it. It measures
+Kilix stacks from the outside: it freezes chosen Kilix source commits and
+packages, installs them into a disposable guest and scores agent tasks there.
+
+## What it does
+
+- Creates, resets and destroys owned QEMU/KVM guests from a checksum-pinned
+  Debian cloud image, with guest networking off.
+- Freezes a selected Kilix stack into a SHA-256-addressed bundle and provisions
+  it offline into a guest (`stack capture`, `stack provision`).
+- Qualifies the base VM, the stack's interfaces and each task route with
+  positive and negative controls before anything is scored.
+- Plans, and with explicit readiness evidence executes, controller sessions
+  across a task/route/model matrix in two tracks (hosted and self-hosted).
+- Scores outcomes from an independent observer and reports controller tokens
+  per verified success, plus timings and project rental spending.
+
 ## Requirements and quick start
 
 Use Linux on x86-64, Python 3.11 or newer, accessible `/dev/kvm`, QEMU,
@@ -51,192 +69,20 @@ error or failed qualification. Inspect the returned `report` path for all
 observations, configuration, image and executable hashes, timestamps and
 cleanup status. Failures remain in the run history.
 
-## Storage and configuration
+## Usage
 
-All runtime data defaults to `~/.local/gpu_terminal/kilix-agent-bench/`:
+| Command | What it does |
+|---|---|
+| `doctor --config FILE`, `qualify --config FILE` | Check the host; run the base VM qualification |
+| `vm create\|start\|status\|stop\|reset\|destroy` | Guest lifecycle |
+| `stack capture --inputs FILE`, `stack qualify --lock FILE`, `stack provision VM_ID --lock FILE` | Freeze, qualify and install a Kilix stack |
+| `qualify-routes --lock FILE --slots N` | Route controls without scoring |
+| `study freeze`, `study manifest` | Bind a protocol and expand a matrix into a manifest |
+| `run --manifest FILE [--execute --readiness FILE]` | Report a plan, or execute it |
+| `recover-attempt DIR`, `dataset report\|ingest`, `timings FILE` | Recovery and reporting |
+| `rentals import-quote\|record\|report` | Project rental spending records |
 
-```text
-images/    verified, read-only base images
-stacks/    frozen software bundles and their configuration locks
-vms/       owned disks, control sockets and private provisioning material
-studies/   experiment definitions and reserved task partitions
-mining/    explicitly imported session data and derived episodes
-runs/      immutable-by-convention run histories and observations
-reports/   generated comparisons
-cache/     replaceable acquisition and build inputs
-```
-
-Use `--data-dir PATH` before the subcommand to override the root. Existing roots
-must be owned by the invoking user and have mode 0700. VM IDs are opaque; names,
-paths and endpoints are generated without referring to a named execution host.
-
-Configuration uses `kilix-agent-bench/config-v1`; unknown fields are rejected.
-The `image` object requires `sha512` and exactly one of `url` (HTTPS) or `path`
-(relative to the configuration file). Inputs must be standalone, unencrypted
-qcow2 images with cloud-init, Python 3, OpenSSH server and the fixture's basic
-system commands. The `vm` object requires integer `cpus`, `memory_mib`,
-`disk_gib` and `boot_timeout_s`. The disk must accommodate the base image.
-Image downloads are bounded to 4 GiB and 900 seconds. A checksum verifies the
-selected bytes; choose the image source and expected checksum independently of
-untrusted task input.
-
-## VM lifecycle and library
-
-```sh
-kilix-agent-bench vm create --config examples/qualification.json
-kilix-agent-bench vm start VM_ID
-kilix-agent-bench vm status VM_ID
-kilix-agent-bench vm stop VM_ID
-kilix-agent-bench vm reset VM_ID
-kilix-agent-bench vm destroy VM_ID
-```
-
-Replace `VM_ID` with the returned ID. `create` prepares a stopped guest; `start`
-waits for cloud-init and fixture readiness. `reset` discards the writable disk,
-creates a fresh overlay and boots again. `destroy` removes that guest after
-confirming its process stopped. Cached base images and run reports remain.
-
-Lifecycle operations use per-VM locks and a shared allocation lock. Process
-ownership checks bind the executable, unique VM name/UUID, opened disk and
-Linux process start identity. A mismatched identity is an error; the tool does
-not signal the process or delete its files. After an interrupted command, use
-the recorded VM ID to inspect and stop or destroy its guest. Reported lifecycle
-state and observed process liveness remain separate.
-
-The same operations are available from `core.Store`, `core.load_config`,
-`vm.VM`, `vm.doctor` and `qualification.qualify`. `tasks.verify` accepts an
-observer record and host-owned expected bytes, independently of the actor.
-The APIs and versioned records are experimental in 0.1.0.
-
-## Frozen stack provisioning
-
-Select reviewed source checkouts, a matching built engine, a complete set of
-Debian dependency packages for the pinned base image, and the exact model
-assets needed by the selected workflow. Capture takes explicit local inputs;
-each repository is exported from its selected commit, including its pinned
-submodules. The snapshot has independent Git objects and clean configuration.
-Tracked working-copy edits, untracked files and existing Git credentials are
-excluded. Each submodule's selected commit must be available locally.
-
-```sh
-kilix-agent-bench stack capture --inputs stack-inputs.json
-kilix-agent-bench stack qualify --lock /path/to/returned-lock.json
-```
-
-`capture` writes a SHA-256-addressed tar bundle and JSON lock under `stacks/`.
-The bundle binds the VM configuration, source identities, setup commands and
-every payload/package file's bytes and mode. Both the host and guest verify
-the member inventory before installation. The limit is 16 GiB and 100,000
-files. Archive paths must be relative and normalized; links, special files,
-duplicates, missing members and changed hashes are rejected. Artifact-tree
-file symlinks are materialized only when their targets remain within that
-tree; directory symlinks and Git snapshot symlinks are unsupported.
-
-The input document uses `kilix-agent-bench/stack-inputs-v1` and requires:
-
-| Field | Content |
-| --- | --- |
-| `benchmark_version` | Release family, such as `0.2.2` |
-| `config` | The complete base-image/VM configuration described above |
-| `repositories` | Entries with `path`, exact 40-digit `commit`, public HTTPS `repository` identity and relative `destination` |
-| `trees` | Explicit artifact directories with `path` and relative `destination` |
-| `files` | Explicit individual files with `path` and relative `destination` |
-| `packages` | Local `.deb` files with `path` and exact `sha256` |
-| `setup` | Steps with a unique lowercase `id`, an `argv` string array and `timeout_s` from 1 to 1800 |
-
-Lists may be empty. Input paths resolve relative to the input document.
-Destinations are below the guest actor's `~/.local/gpu_terminal/` and must not
-overlap. Packages are installed offline using `dpkg`; setup commands then run
-as the unprivileged actor with a clean environment and private home. Stack
-inputs are trusted software: Debian maintainer scripts run as guest root.
-No authentication state is imported automatically. Existing applicable model
-license receipts can be selected explicitly; capture never creates acceptance.
-Model assets, receipts, dependency packages and built binaries remain private
-runtime artifacts and are not distributed in this source repository.
-
-For an already-created guest with exactly the lock's VM configuration:
-
-```sh
-kilix-agent-bench stack provision VM_ID --lock /path/to/stack-lock.json
-```
-
-A failed provision remains recorded in that generation. Reset the guest
-before retrying. Lifecycle locks prevent reset or destruction during
-provisioning. Reset removes the installed software along with the rest of the
-writable disk; the same frozen bundle can provision the new generation.
-
-`stack qualify` creates its own guest, provisions it, checks the interfaces and
-runs the positive literal-file control. It then resets the disk, repeats the
-same provisioning and interface checks, runs the negative control and destroys
-the guest. Evidence includes the package inventory, installed source identities,
-engine selection/hash, commands, observed pane/process identities, actual
-literal input bytes and cleanup results.
-
-The initial interface profile expects this layout below the guest stack root:
-
-```text
-sources/kilix/
-sources/kilix-desktops/kilix-tui-utils/
-sources/kilix-apps/kilix-claudex/
-kilix/build/current/source-id
-kilix/build/current/src/
-kilix/data/desktop-apps/kilix-needle/
-kilix/data/desktop-apps/assets/
-license-receipts/
-```
-
-Setup must install `kilix`, `kilix-needle`, `claudex` and the toolkit commands
-in the actor's `~/.local/bin/`, and prepare the native support libraries.
-The package closure must provide the engine's runtime libraries, development
-tools required by those support libraries, and Xvfb. The profile checks engine
-extension loading, grammar execution, rollout command reuse, model asset/license
-readiness, literal pane input with separate submission, a single routed worker
-and a two-session team. Coding clients in these checks are labeled process
-fixtures. They record the actual delivered argv and cwd; they do not call a
-provider or establish real agent readiness. Model asset readiness does not run
-inference. Other workflow routes need their own qualification before scoring.
-
-## Benchmark versions and later models
-
-`benchmark_version` identifies the workflow release family, separately from
-the Python package version and JSON schema versions. The current family is
-`0.2.2` through that release. After release, changed workflow options can define
-a `0.2.3` benchmark. Within a family, retain immutable protocol revisions and
-hashes of tasks, route eligibility, guides, scorers and the stack lock.
-
-Model, effort and client selections belong to the execution matrix, separate
-from the fixed protocol. Adding a later model reuses the same tasks, seeds,
-guides and software inputs. Record execution dates and provider-reported model
-identities too: a stable model name alone does not freeze a remote service.
-
-## Task routes and independent scoring
-
-The development suite has six task types and sixteen task/route cells:
-
-| Task | Routes | Observed result |
-| --- | --- | --- |
-| Literal file search | Native shell; Needle Files grammar CLI | Exact relative paths and first matching lines, excluding hidden files and symlinks |
-| Literal pane input | Native remote control; `kilix pane send` | Exact UTF-8 bytes with no Enter or extra pane |
-| Total RAM | Native shell; System CLI; Kilix grammar | Value and units checked against guest `/proc/meminfo` |
-| Active log retrieval | Native process/open-file inspection; `kilix rollout log` | Correct active log and last assistant text, with stale decoys |
-| One worker launch | Session-grid CLI; structured action CLI; Claudex; Ask grammar; Ask LFM2 model-only | Exactly one live fixture process and pane with the requested model, cwd and effort |
-| Visible pane reading | Native remote control; `kilix watch` | Visible marker, excluding scrollback and without input |
-
-Worker clients are labeled process fixtures: they verify delivery and launch
-effects without creating child provider sessions. A pending launch receipt does
-not override the independently observed process state. Outcome correctness and
-required-route compliance are recorded separately; both are needed for an
-eligible success. Every task also checks protected fixture hashes and unrelated
-state. Positive and negative controls exercise the scorers.
-
-```sh
-kilix-agent-bench qualify-routes --lock /path/to/stack-lock.json --slots 2
-```
-
-This command defaults to fifteen routes without inference. Adding
-`--allow-helper-inference` includes the local LFM2 model-only route. Qualification
-records never enter the scored dataset. Each qualification slot owns one VM,
-recreates its fixtures between controls, and destroys the guest on completion.
+`--data-dir PATH` before the subcommand moves the runtime root.
 
 ## Freeze, plan and execute
 
@@ -265,138 +111,57 @@ with a `repository_revision` and `profiles` containing `id`, `settings`,
 Artifact paths resolve relative to the matrix file. Settings, client executable
 hashes and the complete schedule are copied into immutable manifests.
 
-Execution adds `--execute --readiness /path/to/receipt.json`. The trusted
-operator supplies a `kilix-agent-bench/execution-readiness-v1` receipt naming
-the matching `protocol_sha256`, `qualified_routes` pairs, and evidence for each
-configuration. Each configuration proof must contain its
-`configuration_sha256` and true `model_accepted`, `settings_verified`,
-`usage_complete` and `vm_tool_verified` fields. Two slots additionally require
-`two_slots_verified: true`. These are declarations backed by reviewed live
-qualification evidence, not a substitute for running that qualification.
+Execution receipts, self-hosted endpoints, recovery and the evidence each
+attempt retains are described in
+[docs/execution-and-evidence.md](docs/execution-and-evidence.md).
 
-Self-hosted execution additionally selects `--configuration ID --endpoint
-/path/to/endpoint.json`. The endpoint records `url`, `served_model`, the exact
-`configuration_sha256`, optional `key_env`, and `runtime` with a container
-`image` digest, `repository_revision`, `precision`, `context_tokens` and
-`launch_argv` identifying parser/template settings. HTTPS or a loopback tunnel
-is required; redirects and mismatched served-model identities are rejected.
-Credentials are referenced by environment variable, never embedded in the URL.
-The harness does not create a GPU rental or start an inference server.
+## How it works
 
-Every scored attempt creates and provisions a fresh guest. At most two VM
-slots are shared across both tracks and runner processes. A per-track lock
-prevents duplicate concurrent batches. Completed task failures are retained
-without automatic retries; interrupted or infrastructure-invalid attempts get
-new attempt IDs on resume. Logical IDs bind configuration settings as well as
-task, route, seed and protocol. Extending a one-round manifest to five rounds
-therefore preserves its completed first-round identities.
-
-```sh
-kilix-agent-bench recover-attempt /path/to/interrupted-attempt
-kilix-agent-bench dataset report
-kilix-agent-bench timings /path/to/attempt/timings.jsonl
+```
+ host                                         disposable guest (KVM)
+ ----                                         ----------------------
+ core.Store  private runtime root             cloud-init seed: actor + observer
+ vm.VM       qemu, overlay disk, SSH  ----->  unprivileged actor runs the task
+ stack       frozen tar bundle + lock ----->  offline dpkg + setup commands
+ runner      bounded trials, two slots        privileged observer reads results
+ tasks       host-owned expected bytes <----  observation record
+ dataset     append-only attempts; usage.py normalizes token counts
 ```
 
-Resume reconciles finalized attempts before scheduling, including crashes
-between evidence finalization and progress recording. Recovery only destroys
-the VM explicitly recorded in that store's attempt. Already-finalized evidence
-remains immutable; later cleanup produces a separate recovery receipt.
+Every scored attempt gets a freshly provisioned guest. The controller acts
+only through the guest command tool; a separate privileged observer records
+before/after state, and the host compares that record with expectations it
+computed itself, so the actor cannot grade its own work. Qualification
+records never enter the scored dataset. Library entry points are
+`core.Store`, `core.load_config`, `vm.VM`, `vm.doctor`,
+`qualification.qualify` and `tasks.verify`.
 
-## Evidence and measurement
+## Documentation
 
-Each attempt retains the exact prompt and configuration, native client events,
-raw self-hosted requests/responses, normalized usage, guest command arguments,
-bounded outputs and truncation flags, execution audit, independent before/after
-observations, scores, timings and cleanup status. A SHA-256 inventory covers all
-retained evidence. Ingestion verifies that inventory and deduplicates attempt
-IDs. Mutable native-client account state is removed before finalization.
+- [docs/storage-and-vms.md](docs/storage-and-vms.md) — runtime root layout, configuration schema, VM lifecycle and locks
+- [docs/stack-provisioning.md](docs/stack-provisioning.md) — stack inputs, bundle verification, interface profile, benchmark versions
+- [docs/task-routes.md](docs/task-routes.md) — the six task types, their routes and independent scoring
+- [docs/execution-and-evidence.md](docs/execution-and-evidence.md) — execution readiness, self-hosted endpoints, recovery, evidence and measurement
+- [docs/rental-spending.md](docs/rental-spending.md) — importing and reporting project rental receipts
+- [docs/qualification-boundaries.md](docs/qualification-boundaries.md) — what each qualification does and does not establish, contract tests
 
-Messages clients retain their saved transcript before cleanup. Its finalized
-per-response usage completes early streamed block counts, with message-ID
-deduplication and reconciliation of input, cache and output totals against the
-session result. Resolved effort comes from response metadata; launch flags and
-text inside messages are not evidence of the effort that ran. Grok retains a
-small session metadata record and keeps client model names separate from
-provider ledger names. A provider alias still requires qualification.
+## Related repositories
 
-Native controllers receive a fresh isolated home at their normal home path,
-read-only credentials, and only the guest command tool. Host files and SSH keys
-are outside that namespace. Provider networking remains available. These are
-controlled fixtures: command admission and execution auditing do not prove
-adversarial isolation against arbitrary interpreter code or a compromised
-controller. Live model/effort acceptance and tool behavior require separate
-qualification for every selected client configuration.
+- [kilix](https://github.com/itsmygithubacct/kilix#readme) — the terminal and verbs a frozen stack installs
+- [kilix-needle](https://github.com/itsmygithubacct/kilix-needle#readme) — Needle grammar and Ask routes exercised by the task routes
+- [kilix-claudex](https://github.com/itsmygithubacct/kilix-claudex#readme) — session routes and teams checked by the interface profile
+- [kilix-tui-utils](https://github.com/itsmygithubacct/kilix-tui-utils#readme) — toolkit commands the stack layout installs
 
-The primary report is controller tokens per verified success within a
-configuration/task/route, including tokens spent on valid failures. Input totals
-include cached context; output totals include reasoning where the provider
-reports that subset. Neither subset is added twice. Local helper inference
-tokens are excluded, while its output consumed by the controller contributes
-to subsequent controller input. Missing, conflicting or unreconciled usage
-cannot produce a savings score. Zero successes cannot produce one either.
-Native clients may expose session aggregates rather than individual responses;
-the normalization record states the available granularity.
+## Part of Plebian-OS
 
-Limits cover tool calls, command duration, output bytes, controller turns and
-session wall time. Token budgets are checked between observable responses, so
-an in-flight response can overshoot. Native output-token caps are not assumed
-when a client cannot expose one. Self-hosted cancellation takes effect between
-requests, with a bounded in-flight timeout. UTC timestamps and monotonic phase
-durations include queueing, provisioning, model sessions or requests, tools,
-scoring and teardown. Nested spans and concurrent trials are never summed into
-an invented batch duration. Timing informs future capacity estimates rather
-than serving as a route-efficiency ranking.
-
-## Project rental spending
-
-Project receipts live at
-`~/.local/gpu_terminal/kilix-agent-bench/rentals/spending.jsonl` by default.
-These commands only import and report records:
-
-```sh
-kilix-agent-bench rentals import-quote /path/to/best-of-3-receipt.json
-kilix-agent-bench rentals record /path/to/owned-instance-or-billing-receipt.json
-kilix-agent-bench rentals report
-```
-
-A receipt needs a stable `event_id`, timezone-qualified `at`, `kind`, source
-identity and `source_sha256`. Register project ownership using `instance_created`
-with `instance_id` and separate `compute_per_hour` and `storage_per_hour` rates.
-Record `instance_state` transitions as `running`, `stopped` or `destroyed`.
-Provider `charge` and `credit` receipts require nonnegative `usd` amounts and a
-unique `billing_id`. Only registered project instances can receive those rows.
-
-Quotes, time/rate estimates and imported charges remain separate. Storage can
-continue while compute is stopped. Unknown billing intervals are reported,
-unrecorded transfers are excluded, and estimates are never added to charges.
-The report covers imported project receipts, not the account's entire balance.
-
-## Qualification boundaries
-
-Base-only `qualify` records `kilix_stack_qualified: false`. Successful
-`stack qualify` records the tested interface scope explicitly. It covers the
-guest OS interfaces and model asset readiness described above. The route
-controls and offline adapter tests extend that coverage; they do not establish
-live provider readiness, guide savings or a working rented inference image.
-Those require separate qualification before a scored study.
-Select and freeze compatible source and executable versions during experiment
-preparation. A capture is a replayable software artifact, not a claim that its
-binary can be rebuilt bit for bit from source.
-
-VM memory and disk admission are local checks, not a scheduler for unrelated
-host workloads. KVM, the host account and provisioning inputs are trusted.
-Guest isolation and observer separation here are intended for controlled task
-fixtures; they are not a qualification for adversarial hypervisor workloads.
-
-Run the contract tests without starting a guest or making model calls:
-
-```sh
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-```
-
-The native image tests use `qemu-img` if available. `qualify` is the separate
-integration check that creates a real guest and verifies both controls and
-cleanup.
+kilix-agent-bench is one of the repositories published alongside
+[Plebian-OS](https://github.com/itsmygithubacct/plebian-os#readme), a Debian
+install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme)
+running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
+desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
+It is not installed on Plebian-OS; it is the harness used to evaluate Kilix
+stacks in disposable VMs. The map of every repository and how it ships is on
+the [components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
 
 ## Upstream interfaces
 
@@ -404,6 +169,8 @@ The VM backend uses [QEMU's documented invocation options](https://www.qemu.org/
 and [cloud-init's NoCloud seed format](https://docs.cloud-init.io/en/latest/reference/datasources/nocloud.html).
 The example image and its checksums are published in the
 [Debian cloud image directory](https://cloud.debian.org/images/cloud/trixie/20261026-2643/).
+
+## License
 
 The library source is licensed under [MIT](LICENSE). Guest images and external
 executables retain their own licenses and are not redistributed in this
